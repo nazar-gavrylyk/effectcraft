@@ -439,6 +439,87 @@ fn a_newer_viewer_frame_calls_off_the_one_rendering() {
     assert_eq!(f.inflight(), 0, "released");
 }
 
+/// Quitting while frames render: `main` returned with a worker still inside a frame's GPU work,
+/// and the process's exit handlers tore the device down under it (SIGSEGV or abort at exit).
+/// `shutdown` returns only once the running frame is done, and the queued ones never start.
+#[test]
+fn shutdown_waits_for_the_frames_rendering_and_drops_the_queued_ones() {
+    use effectcraft_engine::Session;
+    use effectcraft_engine::project::{Footage, FootageKind};
+    use effectcraft_engine::render::Image;
+    use effectcraft_engine::time::FrameRate;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+    /// A movie whose frames each take a while and can't be called off (like a GPU readback).
+    #[derive(Default)]
+    struct Slow {
+        started: AtomicUsize,
+        finished: AtomicUsize,
+        release: std::sync::atomic::AtomicBool,
+    }
+    impl FootageSource for Slow {
+        fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<Image>> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            self.finished.fetch_add(1, Ordering::SeqCst);
+            Some(Arc::new(Image::new(4, 4)))
+        }
+    }
+    struct Release(Arc<Slow>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release.store(true, Ordering::SeqCst);
+        }
+    }
+    let mut s = Session::default();
+    let cid = ItemId(s.execute("comp.new", json!({"name": "A", "width": 8, "height": 8, "duration": 10})).unwrap()["comp"].as_u64().unwrap());
+    let clip = Footage {
+        kind: FootageKind::Video,
+        width: 4,
+        height: 4,
+        has_video: true,
+        frame_rate: FrameRate::FPS_30,
+        duration: Tick::from_seconds_f64(10.0),
+        ..Default::default()
+    };
+    let item = Arc::make_mut(&mut s.project).add_item("clip.mov", Default::default(), None, ItemKind::Footage(clip));
+    s.execute("layer.addItem", json!({"item": item.0})).unwrap();
+    let footage = Arc::new(Slow::default());
+    let src = RenderSource {
+        project: s.project.clone(),
+        footage: footage.clone(),
+        expr: None,
+        layer_cache: Arc::default(),
+        gpu: None,
+        gpu_display: false,
+        disk: None,
+    };
+    let f = Frames::default();
+    let _release = Release(footage.clone());
+    let content = f.content_of(&s.project, s.revision, cid);
+    let key = |frame| FrameKey { revision: s.revision, content, comp: cid.0, frame, scale: 1000, view: 0, opts: 0 };
+    for frame in 0..64 {
+        f.request(&src, key(frame), cid, FrameRate::FPS_30.tick_of(frame), RenderOpts::default());
+    }
+    for _ in 0..1000 {
+        if footage.started.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(footage.started.load(Ordering::SeqCst) > 0, "a frame started rendering");
+    assert!(!f.shutdown(std::time::Duration::ZERO), "an active render prevents shutdown");
+    footage.release.store(true, Ordering::SeqCst);
+    assert!(f.shutdown(std::time::Duration::from_secs(10)), "the workers stopped in time");
+    let started = footage.started.load(Ordering::SeqCst);
+    assert_eq!(footage.finished.load(Ordering::SeqCst), started, "no frame is still rendering once shutdown returns");
+    assert!(started < 64, "the queued frames were dropped ({started} of 64 started)");
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert_eq!(footage.started.load(Ordering::SeqCst), started, "no frame starts after shutdown");
+}
+
 /// #284: scrubbing asks for a viewer frame at every step; a newer one drops the comp's viewer
 /// frames still waiting (they would all render first), but not prefetch frames or another
 /// comp's viewer frame.
@@ -2399,6 +2480,56 @@ fn a_keyframe_edit_reaches_only_the_keys_around_it() {
     }
 }
 
+/// A key edit of an effect parameter re-renders only around the keys it changed, as a Transform
+/// key edit does (#3324): Exposure keyed at frames 30, 60 and 90, its middle key changed. Write-on
+/// reads its Brush Position at every earlier time (a dab per Brush Spacing since the layer's
+/// start), so its middle key edit reaches every frame after it. Every frame kept renders as
+/// before.
+#[test]
+fn an_effect_key_edit_reaches_only_the_frames_that_read_it() {
+    use effectcraft_engine::Session;
+    use effectcraft_engine::project::{LayerId, Value};
+    use effectcraft_engine::render::render_frame;
+    use serde_json::{Value as Json, json};
+    let v2 = |x: f64, y: f64| (json!([x, y]), Value::Vec2([x, y]));
+    let edits = [
+        ("Exposure", "master/exposure", [json!(0.0), json!(1.0), json!(0.0)], Value::Scalar(3.0)),
+        ("Write-on", "brushPosition", [v2(2.0, 2.0).0, v2(14.0, 14.0).0, v2(2.0, 14.0).0], v2(14.0, 2.0).1),
+    ];
+    for (effect, param, values, mid) in edits {
+        let mut s = Session::default();
+        let cid =
+            ItemId(s.execute("comp.new", json!({"name": "A", "width": 16, "height": 16, "duration": 4, "frameRate": 30})).unwrap()["comp"].as_u64().unwrap());
+        let l = s.execute("layer.newSolid", json!({"color": "#808080", "width": 16, "height": 16})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("effect.apply", json!({"layers": [l], "effect": effect})).unwrap();
+        let path = format!("effects/#1/{param}");
+        let fr = s.project.comp(cid).unwrap().frame_rate;
+        for (f, v) in [30, 60, 90].into_iter().zip(values) {
+            let add: Json = json!({"layer": l, "path": path, "time": fr.tick_of(f).seconds(), "value": v});
+            s.execute("prop.addKey", add).unwrap();
+        }
+        let p0 = s.project.clone();
+        let f = Frames::default();
+        let k = |content: u64, frame: i64| FrameKey { content, comp: cid.0, ..key(0, frame, 0) };
+        let id0 = f.content_of(&p0, 1, cid);
+        (0..120).for_each(|i| insert(&f, k(id0, i)));
+        let mut p1 = p0.clone();
+        Arc::make_mut(&mut p1).comp_mut(cid).unwrap().layer_mut(LayerId(l)).unwrap().props.prop_mut(&path).unwrap().keys[1].value = mid;
+        let kept = f.cached_frames(&k(f.content_of(&p1, 2, cid), 0));
+        let same = |i: i64| render_frame(&p0, cid, fr.tick_of(i), 1.0).data == render_frame(&p1, cid, fr.tick_of(i), 1.0).data;
+        assert!(!same(60), "{effect}: the edit shows");
+        assert!(![45, 60, 75].iter().any(|i| kept.contains(i)), "{effect}: {kept:?}");
+        if effect == "Exposure" {
+            assert!((0..=27).chain(93..120).all(|i| kept.contains(&i)), "{effect}: the frames outside the keys stay: {kept:?}");
+        } else {
+            assert!(!same(110) && !kept.contains(&110), "{effect}: the stroke drawn by frame 110 passes the edited key: {kept:?}");
+        }
+        for i in kept {
+            assert!(same(i), "{effect}: kept frame {i} renders differently after the edit");
+        }
+    }
+}
+
 /// Music's Audio Levels keep every frame, in RAM and on disk, while the project's expressions
 /// can't read audio (a wiggle); an expression naming the music's Audio Levels re-renders its layer.
 #[test]
@@ -2885,6 +3016,8 @@ mod frame_files {
 
     fn session(p: &Arc<Project>, dir: &Path) -> Session {
         let disk = DiskCache::open(dir.join("cache"), 1 << 30).unwrap();
+        // (every frame is written, however quick to render: not decided by this machine's speed)
+        disk.set_read_us_per_mb(0);
         let hook_calls = Arc::new(AtomicUsize::new(0));
         let mut frames = Frames::default();
         let calls = hook_calls.clone();
@@ -3124,6 +3257,125 @@ mod frame_files {
     }
 }
 
+/// #3271 review: the memory accountant trims the preview frames held in RAM; GPU frames (video
+/// memory, their own budget) are left alone, even when they are the least recently shown.
+#[test]
+fn the_accountant_trims_only_frames_in_ram() {
+    let Some(gpu) = Gpu::headless() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    let texture = gpu.device().create_texture(&eframe::wgpu::TextureDescriptor {
+        label: None,
+        size: eframe::wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: eframe::wgpu::TextureDimension::D2,
+        format: eframe::wgpu::TextureFormat::Rgba8Unorm,
+        usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let gpu_frame = || FrameImage::Gpu(Arc::new(DisplayFrame { texture: texture.clone(), width: 2, height: 2 }));
+    let frames = Frames::default();
+    {
+        let mut c = frames.cache.lock().unwrap();
+        // The oldest frames are on the GPU.
+        c.insert(key(1, 0, 0), gpu_frame());
+        c.insert(key(1, 1, 0), gpu_frame());
+        c.insert(key(1, 2, 0), img());
+        c.insert(key(1, 3, 0), img());
+    }
+    let memory = PreviewMemory(frames.cache.clone());
+    use effectcraft_engine::render::memory::MemoryHolder;
+    assert_eq!(memory.bytes(), 2 * 16);
+    let next = memory.oldest().unwrap();
+    assert_eq!(next.bytes, 16, "a frame in RAM is offered");
+    assert!(next.cost_us > 0);
+    assert_eq!(memory.drop_oldest(), 16);
+    let c = frames.cache.lock().unwrap();
+    assert!(c.map.contains_key(&key(1, 0, 0)) && c.map.contains_key(&key(1, 1, 0)), "the GPU frames stay");
+    assert!(!c.map.contains_key(&key(1, 2, 0)) && c.map.contains_key(&key(1, 3, 0)), "the oldest frame in RAM went");
+    drop(c);
+    assert_eq!(memory.bytes(), 16);
+}
+
+/// #3301 review: a frame someone still holds (the viewer showing it, from `Frames::get`) is not
+/// offered to the memory accountant: dropping the cache's entry would free nothing, and its bytes
+/// would be counted as freed.
+#[test]
+fn a_frame_held_elsewhere_is_not_offered_to_the_accountant() {
+    use effectcraft_engine::render::memory::MemoryHolder;
+    let frames = Frames::default();
+    {
+        let mut c = frames.cache.lock().unwrap();
+        c.insert(key(1, 0, 0), img());
+        c.insert(key(1, 1, 0), img());
+    }
+    let shown = frames.get(&key(1, 0, 0)).unwrap();
+    // (the other one shown since and let go: the held frame is the least recently shown)
+    drop(frames.get(&key(1, 1, 0)));
+    let memory = PreviewMemory(frames.cache.clone());
+    assert_eq!(memory.drop_oldest(), 16, "the frame nobody holds goes");
+    {
+        let c = frames.cache.lock().unwrap();
+        assert!(c.map.contains_key(&key(1, 0, 0)) && !c.map.contains_key(&key(1, 1, 0)), "the shown frame stays");
+    }
+    assert!(memory.oldest().is_none() && memory.drop_oldest() == 0, "only a held frame left");
+    drop(shown);
+    assert_eq!(memory.drop_oldest(), 16, "let go: offered");
+}
+
+/// #3301: frames a playing preview shows next are protected: other caches give way first, even
+/// for items worth more, until the caches are more than the bounded overage over; past it the
+/// preview frames go too. A frame rendered quickly still costs a typical render.
+#[test]
+fn preview_frames_ahead_of_the_playhead_outlive_old_footage() {
+    use effectcraft_engine::render::memory::{self, Accountant, Candidate, MemoryHolder};
+    struct Footage(Mutex<Vec<Candidate>>);
+    impl MemoryHolder for Footage {
+        fn name(&self) -> &'static str {
+            "footage frames"
+        }
+        fn bytes(&self) -> usize {
+            self.0.lock().unwrap().iter().map(|c| c.bytes).sum()
+        }
+        fn oldest(&self) -> Option<Candidate> {
+            self.0.lock().unwrap().first().copied()
+        }
+        fn drop_oldest(&self) -> usize {
+            let mut v = self.0.lock().unwrap();
+            if v.is_empty() { 0 } else { v.remove(0).bytes }
+        }
+    }
+    let frames = Frames::default();
+    {
+        let mut c = frames.cache.lock().unwrap();
+        for i in 10..12 {
+            c.insert_took(key(1, i, 0), img(), None, None, Some(std::time::Duration::from_micros(100)));
+        }
+    }
+    let preview: Arc<dyn MemoryHolder> = Arc::new(PreviewMemory(frames.cache.clone()));
+    // Stopped: the oldest frame is offered unprotected, with at least a typical render's cost.
+    let offered = preview.oldest().unwrap();
+    assert!(!offered.protected);
+    assert_eq!(offered.cost_us, memory::default_cost(16, memory::DEFAULT_PREVIEW_US_PER_MB));
+    // Playing from frame 10: the frames ahead are protected.
+    frames.set_playhead(Some(playhead(10, false)));
+    assert!(preview.oldest().unwrap().protected);
+    // A footage frame worth far more per byte, used just now, still goes first.
+    let footage = Arc::new(Footage(Mutex::new(vec![Candidate::new(memory::tick(), 16, 1_000_000)])));
+    let footage_holder: Arc<dyn MemoryHolder> = footage.clone();
+    let acc = Accountant::new(1000);
+    acc.register(&preview);
+    acc.register(&footage_holder);
+    acc.set_budget(40);
+    assert_eq!(footage.bytes(), 0, "the footage frame went");
+    assert_eq!(preview.bytes(), 32, "the preview frames stay, a bounded way over");
+    // Far over the budget, past the overage: the preview frames go too.
+    acc.set_budget(10);
+    assert!(preview.bytes() < 32, "{}", preview.bytes());
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn gpu_renders_in_flight_stay_within_the_cap() {
@@ -3337,11 +3589,12 @@ fn gpu_preview_lane_waits_for_admission_and_resets_its_marker() {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(LANE_WIDTH).build().unwrap();
     let (started, ready) = std::sync::mpsc::channel();
     let (tx, rx) = std::sync::mpsc::channel();
+    let drains = std::sync::atomic::AtomicUsize::new(0);
     let (early, admitted, helper) = std::thread::scope(|scope| {
         scope.spawn(|| {
             pool.install(|| {
-                let _drain = Draining::enter(Some(0)).unwrap();
-                assert!(Draining::enter(None).is_none(), "a lane cannot start a nested drain");
+                let _drain = Draining::enter(Some(0), &drains).unwrap();
+                assert!(Draining::enter(None, &drains).is_none(), "a lane cannot start a nested drain");
                 assert!(DRAINING_LANE.get(), "nested rejection must not clear the lane marker");
                 started.send(()).unwrap();
                 tx.send(slots.for_render(2).is_some()).unwrap();
@@ -3365,10 +3618,11 @@ fn gpu_preview_lane_waits_for_admission_and_resets_its_marker() {
         assert!(!DRAINING.get());
         assert!(!DRAINING_LANE.get());
         let panic = std::panic::catch_unwind(|| {
-            let _drain = Draining::enter(Some(0)).unwrap();
+            let _drain = Draining::enter(Some(0), &drains).unwrap();
             panic!("synthetic lane failure");
         });
         assert!(panic.is_err());
+        assert_eq!(drains.load(Ordering::SeqCst), 0, "a panicking drain leaves the count");
         assert!(!DRAINING.get());
         assert!(!DRAINING_LANE.get());
     });

@@ -12,6 +12,7 @@ mod aux_channels;
 mod collapse;
 mod color;
 mod drop_shadow_cover;
+mod fill_cover;
 mod footage_size;
 mod frame_blend;
 mod guides;
@@ -695,6 +696,34 @@ fn particle_systems_ii_and_mr_mercury_keep_a_burst_after_birth_rate_drops_to_zer
         assert!((light(&k) - light(&z)).abs() > 1.0, "{id}: the burst is still drawn: {} vs {}", light(&k), light(&z));
         assert_same(&render_cached(&keyed, cid, at(1.9), None), &render_cached(&none, cid, at(1.9), None), &format!("{id}: gone after Longevity"));
     }
+}
+
+/// A Particle Playground cannon-position expression reads the cannon's position at earlier
+/// times, so its layer cannot be served from a cache keyed only by the current value.
+#[test]
+fn particle_playground_with_a_cannon_position_expression_is_not_layer_cached() {
+    let (mut p, cid, comp) = setup();
+    let mut l = solid(&mut p, &comp, [0.0, 0.0, 0.0], 200, 100);
+    add_effect(
+        &mut p,
+        &mut l,
+        "ec.sim.particleplayground",
+        [200.0, 100.0],
+        &[("grid/particlesAcross", Value::Scalar(0.0)), ("grid/particlesDown", Value::Scalar(0.0)), ("cannon/particlesPerSecond", Value::Scalar(60.0))],
+    );
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = p.comp(cid).unwrap();
+    let key = crate::cache::layer_key(&crate::eval::EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(0.9)), &c.layers[0], 1.0, false, false);
+    assert!(key.is_some(), "a static cannon position is cacheable");
+
+    let fx = p.comp_mut(cid).unwrap().layers[0].props.sub_mut("effects").unwrap().children.iter_mut().find_map(|c| match c {
+        effectcraft_project::Node::Group(g) => Some(g),
+        _ => None,
+    });
+    fx.unwrap().prop_mut("cannon/cannonPosition").unwrap().expr = Some(effectcraft_project::Expression { text: "time * 10".into(), enabled: true });
+    let c = p.comp(cid).unwrap();
+    let key = crate::cache::layer_key(&crate::eval::EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(0.9)), &c.layers[0], 1.0, false, false);
+    assert!(key.is_none(), "the cannon's parameter history is not cacheable");
 }
 
 /// A Birth Rate expression on any of the stepped particle systems keeps the layer out of the

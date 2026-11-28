@@ -120,9 +120,9 @@ pub use time_fx::{PixelMotion, TimewarpPlan, TwStep, pmb_plan, posterized_time, 
 pub use ocio::color_stabilizer_maps;
 // GPU effects, part B (3D Channel, Immersive Video, colour management, simulation render passes).
 pub use channel3d::{
-    CRYPTO_LAYERS, CryptoAux, EXTRACTOR_COPY, MATTE_ONLY_IN_ALPHA, aux_point, crypto_aux_image, crypto_aux_image_with, crypto_layer_choices, crypto_layer_menu,
-    crypto_layer_name, crypto_layer_named, extractor_aux_channel, extractor_own_channel, id_color, is_extractor_copy, matte_only_px, reads_aux,
-    selection_hashes,
+    CRYPTO_LAYERS, CryptoOutput, CryptoPlane, EXTRACTOR_COPY, MATTE_ONLY_IN_ALPHA, aux_need, aux_needs, aux_point, crypto_aux_image, crypto_box_scale,
+    crypto_layer_choices, crypto_layer_menu, crypto_layer_name, crypto_layer_named, crypto_plane, extractor_aux_channel, extractor_own_channel, id_color,
+    is_extractor_copy, matte_only_px, pixel_margin, reads_aux, selection_hashes,
 };
 pub use file_cache::{check_lut_files, lut_generation};
 pub use ocio::{ColorOp, Straight, Tf, color_program};
@@ -567,8 +567,8 @@ pub trait EffectHost: Sync {
     }
     /// Parameter `id` (a [`flatten_params`] id such as `birthRate`) of effect `effect_index` in
     /// the layer's stack (the running effect's [`EffectEnv::effect_index`]) at another **layer
-    /// time**: Particle Emitter 3D samples its Birth Rate at every step it simulates (#1373).
-    /// `None` when unavailable.
+    /// time**: stepped particle systems sample their Birth Rate (#1373) and producer position
+    /// at every step they simulate. `None` when unavailable.
     fn param_at(&self, _effect_index: usize, _id: &str, _layer_time: f64) -> Option<Value> {
         None
     }
@@ -669,6 +669,20 @@ impl EffectSpec {
     /// renderer's full-layer cover and keep the pyramid grid phase (#1205).
     pub fn skips_cover(&self) -> bool {
         SKIPS_COVER.contains(&self.id)
+    }
+
+    /// [`EffectSpec::skips_cover`] for one instance, given its current parameters (evaluated only
+    /// when the answer depends on them). Fill without Invert or feather only recolours pixels the
+    /// layer already has, masked or not, so it needs no room beyond them: covering the whole layer
+    /// rectangle only inflated working images on scaled-up text (#4158). Inverted, it paints the
+    /// layer's transparent area; feathered, a mask edge outside the painted pixels still blurs into
+    /// them. Both keep the cover.
+    pub fn skips_cover_for(&self, params: impl FnOnce() -> Params) -> bool {
+        self.skips_cover()
+            || (self.id == "ec.generate.fill" && {
+                let p = params();
+                !p.b("invert") && p.f("horizontalFeather") <= 0.0 && p.f("verticalFeather") <= 0.0
+            })
     }
 }
 
@@ -917,6 +931,8 @@ pub fn instantiate(spec: &EffectSpec, ids: &mut Ids, instance_name: &str, layer_
         if matches!(ps.ui, ParamUi::Checkbox | ParamUi::Popup { .. } | ParamUi::Layer) {
             pr.hold_only = true;
         }
+        // (the channels an effect reads: not animatable, as in After Effects)
+        pr.static_only = channel3d::selects_channels(spec.id, ps.id);
         match path.and_then(|path| nested_group(&mut g, ids, path)) {
             Some(sub) => sub.children.push(pr.into()),
             None => g.children.push(pr.into()),
@@ -1522,10 +1538,10 @@ pub fn is_time_dependent(id: &str) -> bool {
 }
 
 /// Does effect `id` read its own parameters at earlier times (the stepped particle systems sample
-/// their Birth Rate at every step, #1373)? Caches keyed on the current values can't see what an
-/// expression returned then.
+/// their Birth Rate and producer position at every step, #1373)? Caches keyed on the current
+/// values can't see what an expression returned then.
 pub fn reads_param_history(id: &str) -> bool {
-    matches!(id, "ec.sim.ccparticleworld" | "ec.sim.ccparticlesystems2" | "ec.sim.ccmrmercury")
+    matches!(id, "ec.sim.ccparticleworld" | "ec.sim.ccparticlesystems2" | "ec.sim.ccmrmercury" | "ec.sim.particleplayground")
 }
 
 /// Run an effect on a buffer.

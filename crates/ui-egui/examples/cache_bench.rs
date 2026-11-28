@@ -225,7 +225,10 @@ fn main() {
 fn play(session: effectcraft_engine::Session, cid: ItemId, secs: f64, gpu: bool) {
     use effectcraft_ui_egui::{ControlRequest, EffectcraftApp};
     let (tx, rx) = std::sync::mpsc::channel::<ControlRequest>();
-    let builder = egui_kittest::Harness::builder().with_size(egui::vec2(1920.0, 1200.0)).with_pixels_per_point(1.0);
+    let builder = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1920.0, 1200.0))
+        .with_pixels_per_point(1.0)
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless);
     let builder = if gpu { builder.wgpu() } else { builder };
     let mut h = builder.build_eframe(move |_| EffectcraftApp::new(session).with_control(rx));
     {
@@ -248,7 +251,7 @@ fn play(session: effectcraft_engine::Session, cid: ItemId, secs: f64, gpu: bool)
     }
     h.state().frames.clear();
     let (reply, _r) = std::sync::mpsc::channel();
-    let _ = tx.send(ControlRequest { method: "ui.playback".into(), params: json!({"action": "play"}), reply });
+    let _ = tx.send(ControlRequest { method: "ui.playback".into(), params: json!({"action": "play"}), reply, abandoned: Default::default() });
     let t0 = Instant::now();
     let (mut started, mut stalled, mut last, mut scales) = (None, 0.0, t0, std::collections::BTreeMap::<u32, u64>::new());
     // When each new frame went on screen (seconds since play was pressed): the cadence. The

@@ -67,7 +67,7 @@ impl Outcome {
 /// The session and per-run state while a script runs (the natives reach it here; nothing
 /// borrowed ever enters the JS heap).
 pub(crate) struct Active {
-    pub(crate) session: Session,
+    pub(crate) session: crate::ui::SessionParcel,
     pub(crate) output: Vec<String>,
     /// Open groups: name, project snapshot, original bounded history and saved-project
     /// identity. The history snapshot preserves earlier steps if long groups hit the limit.
@@ -86,9 +86,22 @@ pub(crate) struct Active {
 }
 
 impl Active {
-    pub(crate) fn new(session: Session, name: &str, host: u32) -> Active {
+    pub(crate) fn new(session: impl Into<crate::ui::SessionParcel>, name: &str, host: u32) -> Active {
+        let session = session.into();
         let yield_renders = session.script_ui.yield_renders;
         Active { session, output: vec![], groups: vec![], name: name.to_string(), host, link: None, yield_renders, loading: vec![] }
+    }
+}
+
+impl Drop for Active {
+    fn drop(&mut self) {
+        // An unexpected host unwind can bypass normal settlement. Preserve the outer group's
+        // pre-script history before the parcel returns the actual session to its caller.
+        if self.session.recoverable()
+            && let Some((name, snap, prior, saved)) = self.groups.first()
+        {
+            collapse(&mut self.session, name, snap, prior, saved);
+        }
     }
 }
 
@@ -562,7 +575,7 @@ pub(crate) fn new_context() -> Result<Context, String> {
     let limits = ctx.runtime_limits_mut();
     limits.set_loop_iteration_limit(200_000_000);
     limits.set_recursion_limit(2000);
-    let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 11] = [
+    let natives: [(JsString, usize, fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>); 12] = [
         (js_string!("__exec"), 2, native_exec),
         (js_string!("__query"), 2, native_query),
         (js_string!("__print"), 1, native_print),
@@ -574,6 +587,7 @@ pub(crate) fn new_context() -> Result<Context, String> {
         (js_string!("__uiNewId"), 0, crate::ui::native_new_id),
         (js_string!("__uiModal"), 1, crate::ui::native_modal),
         (js_string!("__uiLayoutNative"), 1, crate::ui::native_layout),
+        (js_string!("__fileDialog"), 5, crate::ui::native_file_dialog),
     ];
     for (name, len, f) in natives {
         ctx.register_global_callable(name, len, NativeFunction::from_fn_ptr(f)).map_err(|e| e.to_string())?;
@@ -702,8 +716,8 @@ pub(crate) struct Restore<'a> {
 
 impl Drop for Restore<'_> {
     fn drop(&mut self) {
-        if let Some(a) = ACTIVE.with(|c| c.borrow_mut().take()) {
-            *self.target = a.session;
+        if let Some(mut a) = ACTIVE.with(|c| c.borrow_mut().take()) {
+            *self.target = std::mem::take(&mut a.session).into_session();
         }
     }
 }

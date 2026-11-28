@@ -98,7 +98,8 @@ pub use doc_state::{CompSelection, EditorState, KeyClip, KeyMove, KeyRef, LinkCl
 pub use error::{EngineError, Result};
 pub use event::Event;
 pub use fonts::{FontRow, font_features, font_menu, font_preview, font_styles, text_families};
-pub use services::{FsServices, Importer, Services};
+pub use output_guard::OutputGuard;
+pub use services::{FsServices, Importer, PCRAFT_MAX_INPUT, Services, pcraft_too_large};
 pub use session::upgrade_effects;
 
 pub struct Session {
@@ -227,6 +228,14 @@ pub struct Session {
     /// The last physical-memory reading (Settings ▸ Memory & CPU budgets); `None` = unknown
     /// (headless sessions don't query it, see [`Session::memory_tick`]).
     pub sys_memory: Option<sysinfo::SysMemory>,
+    /// The system is in a low-memory episode (the cache budgets stay reduced until it ends, see
+    /// [`sysinfo::SysMemory::still_low`] and [`Session::memory_budget`]).
+    pub memory_low: bool,
+    /// The most the footage frames (and decoded planes) hold by themselves, below the common
+    /// budget ([`Session::apply_cache_budgets`]); `None`: the whole budget, as in the desktop app.
+    /// Headless sessions (the CLI, its MCP server) set it: their renders read each footage frame
+    /// about once, so frames kept up to the whole budget only cost memory (#4157).
+    pub footage_cap: Option<usize>,
     /// The keyframe drag in progress (`keys.move` with a merge key).
     pub key_move: Option<KeyMove>,
     /// Reads the system's memory in the background for [`Session::memory_tick`].
@@ -266,13 +275,22 @@ pub struct Session {
     /// Each footage file's size and modification time when last seen (Settings ▸ Import ▸
     /// Reload Footage Changed on Disk, [`footage_reload`]).
     pub footage_stamps: std::collections::HashMap<String, footage_reload::Stamp>,
+    /// Footage reloaded so far ([`Session::forget_decoded`]): part of the Project panel's
+    /// thumbnail keys ([`Session::thumbnail_key`]), which otherwise look at no file.
+    pub footage_reloads: std::sync::atomic::AtomicU64,
     /// The footage files effects read the channels of, as last given to the footage source
     /// ([`Session::refresh_aux_footage`]); `None` = not given yet.
     pub aux_footage: Option<Vec<String>>,
+    /// What the effects read of each of those files, as last given ([`Session::refresh_aux_footage`],
+    /// #3271); `None` = not given yet.
+    pub aux_needs: Option<Vec<(String, effectcraft_raster::channels3d::AuxNeed)>>,
     /// How many script-issued commands are running ([`Session::execute_for_script`]): while one
     /// is, settings that guard what scripts may do can't change (see
     /// [`prefs::Scripting::same_permissions`]).
     pub script_calls: ScriptCalls,
+    /// Output guards built so far ([`Session::output_guard`]; a command checks all the files it
+    /// writes with one, #3328).
+    pub output_guards: std::sync::atomic::AtomicU64,
 }
 
 /// The count behind [`Session::running_for_script`]; only the engine changes it.
@@ -380,6 +398,8 @@ impl Default for Session {
             library: Default::default(),
             script_ui: scriptui::ScriptUi::default(),
             sys_memory: None,
+            memory_low: false,
+            footage_cap: None,
             key_move: None,
             memory_watch: Default::default(),
             disk_watch: Default::default(),
@@ -397,8 +417,11 @@ impl Default for Session {
             check_footage_on_open: false,
             stored_paths: Default::default(),
             footage_stamps: Default::default(),
+            footage_reloads: Default::default(),
             aux_footage: None,
+            aux_needs: None,
             script_calls: ScriptCalls::default(),
+            output_guards: Default::default(),
         }
     }
 }

@@ -38,7 +38,10 @@ impl Rig {
         };
         std::sync::Arc::make_mut(&mut s.project).add_item("clip.png", Label::Aqua, None, ItemKind::Footage(clip));
         let mut app = Some(EffectcraftApp::new(s));
-        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| app.take().expect("app"));
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1600.0, 1000.0))
+            .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+            .build_eframe(|_| app.take().expect("app"));
         h.run_steps(2);
         Rig { h, dir }
     }
@@ -92,6 +95,19 @@ fn render_frame_never_writes_over_a_file_the_project_reads() {
     let v = r.reply("render.frame", json!({"path": r.text("inline.png"), "base64": true, "write": true}));
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["result"]["png"].as_str(), Some(control::base64(&r.read("inline.png")).as_str()));
+}
+
+/// #3328: `render.frame` over an existing file checks the project's files once, before the
+/// render, and writes with that check (it looked at every footage frame twice).
+#[test]
+fn render_frame_over_an_existing_file_checks_the_project_once() {
+    let mut r = Rig::new("render-frame-once");
+    std::fs::write(r.dir.join("frame.png"), b"an older frame").unwrap();
+    let before = r.h.state().session.output_guards.load(std::sync::atomic::Ordering::Relaxed);
+    let v = r.reply("render.frame", json!({"path": r.text("frame.png")}));
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(&r.read("frame.png")[..8], b"\x89PNG\r\n\x1a\n", "replaced");
+    assert_eq!(r.h.state().session.output_guards.load(std::sync::atomic::Ordering::Relaxed) - before, 1, "one guard");
 }
 
 #[test]

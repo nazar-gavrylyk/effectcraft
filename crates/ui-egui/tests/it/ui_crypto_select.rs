@@ -63,7 +63,12 @@ fn harness(s: Session) -> Harness<'static, EffectcraftApp> {
         dock::hsplit(SplitSize::FixedSecond(420.0), dock::tabs(&[PanelKind::Composition], 0), dock::tabs(&[PanelKind::EffectControls], 0)),
         dock::tabs(&[PanelKind::Timeline], 0),
     ));
-    let mut h = Harness::builder().with_size(vec2(1400.0, 800.0)).with_pixels_per_point(1.0).with_step_dt(0.25).build_eframe(|_| app);
+    let mut h = Harness::builder()
+        .with_size(vec2(1400.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .with_step_dt(0.25)
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .build_eframe(|_| app);
     settle(&mut h);
     h
 }
@@ -158,8 +163,8 @@ fn the_selection_tool_picks_while_the_cryptomatte_effect_is_selected() {
     assert_eq!(selection(&h, &ids), "", "Ctrl removes");
     click(&mut h, b, Modifiers::NONE);
     assert_eq!(selection(&h, &ids), "c3_3");
-    click(&mut h, b, Modifiers::CTRL);
-    assert_eq!(selection(&h, &ids), "", "Ctrl (not Cmd) removes too");
+    click(&mut h, b, if cfg!(target_os = "macos") { Modifiers::ALT } else { Modifiers::CTRL });
+    assert_eq!(selection(&h, &ids), "", "the platform remove modifier removes too");
     click(&mut h, b, Modifiers::NONE);
     assert_eq!(selection(&h, &ids), "c3_3");
     assert_eq!(undo_steps(&h), steps + 7, "one undo step per pick");

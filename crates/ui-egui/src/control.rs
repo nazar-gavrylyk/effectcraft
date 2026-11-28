@@ -37,6 +37,10 @@ pub struct ControlRequest {
     pub method: String,
     pub params: Value,
     pub reply: Sender<Value>,
+    /// Set by whoever sent it once nobody waits for the reply any more (the control server's
+    /// timeout): a request not begun by then is not run (#3328: requests that had timed out ran
+    /// later, one after another, and a client that went on sending kept the window busy).
+    pub abandoned: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ControlRequest {
@@ -44,7 +48,12 @@ impl ControlRequest {
     /// receive the UI thread's reply.
     pub fn new(method: impl Into<String>, params: Value) -> (Self, std::sync::mpsc::Receiver<Value>) {
         let (tx, rx) = std::sync::mpsc::channel();
-        (Self { method: method.into(), params, reply: tx }, rx)
+        (Self { method: method.into(), params, reply: tx, abandoned: Default::default() }, rx)
+    }
+
+    /// Whether the sender stopped waiting for the reply ([`ControlRequest::abandoned`]).
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -756,9 +765,11 @@ fn quit(app: &mut EffectcraftApp, ctx: &egui::Context, p: &Value) -> Outcome {
 /// temp file) or inline as base64 when `base64: true`. `write: true` with `base64: true` does both.
 fn render_frame(app: &EffectcraftApp, p: &Value) -> Outcome {
     let s = &app.session;
-    // A file the project reads is never the output (checked before rendering).
+    // A file the project reads is never the output (checked before rendering, and the write
+    // after it uses the same guard: it looks at the project's files once, #3328).
+    let guard = s.output_guard();
     if let Some(path) = p.get("path").and_then(Value::as_str)
-        && let Err(e) = s.refuse_export(path)
+        && let Err(e) = guard.refuse(path)
     {
         return err(e);
     }
@@ -792,7 +803,7 @@ fn render_frame(app: &EffectcraftApp, p: &Value) -> Outcome {
     if inline {
         out["png"] = json!(base64(&png));
     }
-    match s.write_output(&path, &png) {
+    match s.write_output_guarded(&guard, &path, &png) {
         Ok(()) => {
             out["path"] = json!(path);
             ok(out)
@@ -813,9 +824,9 @@ pub fn base64(data: &[u8]) -> String {
 pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
     // A logic-only tick refreshes the viewport information but not `InputState`'s screen rect.
     let size = ctx.input(|i| i.viewport().inner_rect).map_or_else(|| ctx.content_rect().size(), |r| r.size());
-    let keyboard_focus = ctx.memory(|m| m.focused()).map(|id| {
-        let response = ctx.read_response(id);
-        let rect = response.as_ref().map(|r| [r.rect.min.x, r.rect.min.y, r.rect.width(), r.rect.height()]);
+    let keyboard_focus = craft_ui::runtime::access::focused_node(ctx).or_else(|| ctx.memory(|m| m.focused())).map(|id| {
+        let automation = app.auto.elements.iter().chain(app.auto.previous.iter()).find(|e| e.response_id == Some(id));
+        let rect = ctx.read_response(id).map(|r| [r.rect.min.x, r.rect.min.y, r.rect.width(), r.rect.height()]).or_else(|| automation.map(|e| e.rect));
         // The registry names screen elements independently of egui's internal ids. Report
         // exact rectangle matches rather than guessing which enclosing panel owns focus.
         let candidates: Vec<&str> = app
@@ -825,7 +836,7 @@ pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
             .filter(|e| rect.is_some_and(|r| e.rect.iter().zip(r).all(|(a, b)| (*a - b).abs() < 0.01)))
             .map(|e| e.id.as_str())
             .collect();
-        let automation_id = app.auto.elements.iter().chain(app.auto.previous.iter()).find(|e| e.response_id == Some(id)).map(|e| e.id.as_str());
+        let automation_id = automation.map(|e| e.id.as_str());
         json!({"id": format!("{:016x}", id.value()), "rect": rect, "automationId": automation_id, "registryCandidates": candidates})
     });
     let mut ui = json!(app.ui);
