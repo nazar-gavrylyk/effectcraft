@@ -551,7 +551,8 @@ fn dropdown_edit_targets_its_instance_and_applies_one_undoable_change() {
     let mut app = EffectcraftApp::new(s);
     app.show_panel(PanelKind::EffectControls);
     app.toggle_maximize(PanelKind::EffectControls);
-    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(|_| app);
+    let mut h =
+        Harness::builder().with_size(egui::vec2(1200.0, 800.0)).with_context_setup(effectcraft_ui_egui::framework::install_headless).build_eframe(|_| app);
     h.run_steps(4);
 
     let options = |h: &Harness<'_, EffectcraftApp>, effect| {
@@ -601,7 +602,11 @@ fn dropdown_text_undo_follows_the_item_and_starts_fresh_on_reopen() {
     let mut app = EffectcraftApp::new(session);
     app.show_panel(PanelKind::EffectControls);
     app.toggle_maximize(PanelKind::EffectControls);
-    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).with_step_dt(1.0 / 60.0).build_eframe(|_| app);
+    let mut h = Harness::builder()
+        .with_size(egui::vec2(1200.0, 800.0))
+        .with_context_setup(effectcraft_ui_egui::framework::install_headless)
+        .with_step_dt(1.0 / 60.0)
+        .build_eframe(|_| app);
     h.run_steps(4);
 
     let edit = format!("effectControls.effect.{effect}.edit");
@@ -637,7 +642,8 @@ fn dropdown_editor_row_actions_name_their_row() {
     let mut app = EffectcraftApp::new(session);
     app.show_panel(PanelKind::EffectControls);
     app.toggle_maximize(PanelKind::EffectControls);
-    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(|_| app);
+    let mut h =
+        Harness::builder().with_size(egui::vec2(1200.0, 800.0)).with_context_setup(effectcraft_ui_egui::framework::install_headless).build_eframe(|_| app);
     h.run_steps(4);
     click_id(&mut h, &format!("effectControls.effect.{effect}.edit"));
     // The default list has three items; keep two so the first and last rows are both edges.
