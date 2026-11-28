@@ -53,13 +53,15 @@ struct Stand {
     lead: u32,
     fail: Fail,
     declines: Option<String>,
+    /// Added to the delay the job reports, so it differs from the `dts` lead it produces.
+    delay_error: u32,
     target: PathBuf,
     calls: Arc<Calls>,
 }
 
 impl Stand {
     fn new(target: &Path) -> Stand {
-        Stand { lead: 0, fail: Fail::Never, declines: None, target: target.to_owned(), calls: Arc::default() }
+        Stand { lead: 0, fail: Fail::Never, declines: None, delay_error: 0, target: target.to_owned(), calls: Arc::default() }
     }
 }
 
@@ -67,6 +69,7 @@ struct StandJob {
     enc: craft_video::h264::Encoder,
     den: i64,
     lead: u32,
+    delay_error: u32,
     frame: u64,
     ready: Vec<HardwarePacket>,
     fail: Fail,
@@ -91,6 +94,7 @@ impl HardwareVideo for Stand {
             enc,
             den: i64::from(r.rate[1]),
             lead: self.lead,
+            delay_error: self.delay_error,
             frame: 0,
             ready: vec![],
             fail: self.fail,
@@ -118,7 +122,7 @@ impl HardwareJob for StandJob {
         self.enc.avcc()
     }
     fn delay(&self) -> u32 {
-        self.lead
+        self.lead + self.delay_error
     }
     fn submit(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Result<(), ExportError> {
         if self.fail == Fail::Submit(self.frame) {
@@ -265,4 +269,26 @@ fn hardware_is_not_asked_for_formats_other_than_h264() {
 
     assert_eq!(stand.calls.opened.load(Ordering::SeqCst), 0);
     assert!(r.timing.encoder.contains("H.264 only"), "{}", r.timing.encoder);
+}
+
+/// A job whose first packet's offset is not the delay it reported would present its frames at
+/// the wrong times without a sign: the export fails and says what it saw.
+#[test]
+fn a_first_packet_offset_that_differs_from_the_reported_delay_fails_the_export() {
+    for (lead, delay_error) in [(1u32, 1u32), (2, 1), (0, 2)] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("hw.mp4");
+        let mut stand = Stand::new(&path);
+        stand.lead = lead;
+        stand.delay_error = delay_error;
+        let r = run(12, &h264(), Some(&stand), &path, |_| true);
+
+        match r {
+            Err(ExportError::Encode(why)) => {
+                assert!(why.contains(&format!("delay of {} frames", lead + delay_error)) && why.contains("pts - dts must be"), "{why}");
+            }
+            other => panic!("lead {lead}, delay off by {delay_error}: expected an error, got {other:?}"),
+        }
+        assert!(!path.exists() && !part(&path).exists());
+    }
 }

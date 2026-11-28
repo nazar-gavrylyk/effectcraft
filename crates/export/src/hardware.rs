@@ -25,7 +25,8 @@ pub struct HardwareRequest {
 }
 
 /// One encoded frame. `pts` and `dts` are in 1 / `rate[0]` seconds; `dts` is negative while the
-/// encoder holds frames back.
+/// encoder holds frames back. The first packet's `pts - dts` is [`HardwareJob::delay`] frames
+/// (`delay * rate[1]`): the export starts the movie that far in, so another offset is an error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HardwarePacket {
     /// Length-prefixed NAL units, one MP4 sample.
@@ -55,7 +56,8 @@ pub trait HardwareJob: Send {
     fn description(&self) -> String;
     /// The `avcC` record.
     fn codec_config(&self) -> Vec<u8>;
-    /// Frames the encoder holds back (B-frame reordering); 0 for none.
+    /// Frames the encoder holds back (B-frame reordering); 0 for none. The first packet must
+    /// have `pts - dts` equal to `delay * rate[1]`.
     fn delay(&self) -> u32;
     /// An 8-bit 4:2:0 picture, planes tightly packed.
     fn submit(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Result<()>;
@@ -110,24 +112,36 @@ pub(crate) struct HardwareH264 {
     rate: FrameRate,
     codes: Codes,
     finished: bool,
+    /// The first packet has been checked against [`HardwareJob::delay`].
+    checked: bool,
 }
 
 impl HardwareH264 {
     fn new(job: Box<dyn HardwareJob>, w: u32, h: u32, rate: FrameRate, codes: Codes) -> Result<HardwareH264> {
         let config =
             AvcConfig::parse(&job.codec_config()).map_err(|e| ExportError::Encode(format!("the hardware encoder's codec configuration is invalid: {e}")))?;
-        Ok(HardwareH264 { job, config, w, h, rate, codes, finished: false })
+        Ok(HardwareH264 { job, config, w, h, rate, codes, finished: false, checked: false })
     }
 
-    fn packets(ps: Vec<HardwarePacket>) -> Result<Vec<Packet>> {
-        ps.into_iter()
-            .map(|p| {
-                let cto = p.pts.checked_sub(p.dts).and_then(|d| i32::try_from(d).ok());
-                let cto =
-                    cto.ok_or_else(|| ExportError::Encode(format!("the hardware encoder gave a frame time out of range (pts {}, dts {})", p.pts, p.dts)))?;
-                Ok(Packet { data: p.data, key: p.key, cto })
-            })
-            .collect()
+    fn packets(&mut self, ps: Vec<HardwarePacket>) -> Result<Vec<Packet>> {
+        let expected = i64::from(self.job.delay()) * self.rate.den;
+        let mut out = Vec::with_capacity(ps.len());
+        for p in ps {
+            let offset = p.pts.checked_sub(p.dts);
+            let cto = offset.and_then(|d| i32::try_from(d).ok());
+            let cto = cto.ok_or_else(|| ExportError::Encode(format!("the hardware encoder gave a frame time out of range (pts {}, dts {})", p.pts, p.dts)))?;
+            if !self.checked && i64::from(cto) != expected {
+                return Err(ExportError::Encode(format!(
+                    "the hardware encoder reported a delay of {} frames, but its first frame has pts {} and dts {}; pts - dts must be {expected}",
+                    self.job.delay(),
+                    p.pts,
+                    p.dts
+                )));
+            }
+            self.checked = true;
+            out.push(Packet { data: p.data, key: p.key, cto });
+        }
+        Ok(out)
     }
 }
 
@@ -148,12 +162,13 @@ impl VideoEncoder for HardwareH264 {
     fn encode_yuv420(&mut self, p: &Yuv420, _index: u64) -> Result<Vec<Packet>> {
         let (y, u, v) = p.slices(self.w as usize, self.h as usize);
         self.job.submit(y, u, v)?;
-        Self::packets(self.job.take_packets()?)
+        let ps = self.job.take_packets()?;
+        self.packets(ps)
     }
     fn flush(&mut self) -> Result<Vec<Packet>> {
         let ps = self.job.finish()?;
         self.finished = true;
-        Self::packets(ps)
+        self.packets(ps)
     }
     fn media_start(&self) -> Option<i64> {
         (self.job.delay() > 0).then(|| i64::from(self.job.delay()) * self.rate.den)
