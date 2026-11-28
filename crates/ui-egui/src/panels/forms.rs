@@ -890,8 +890,12 @@ fn string_list(
                 });
                 let edit = ui.add(egui::TextEdit::multiline(&mut item.text).id(id).desired_rows(1).desired_width(160.0).hint_text(tr("Item name")));
                 regs.push((format!("{prefix}.{i}"), edit.rect, item.text.clone()));
+                let row = i + 1;
+                crate::a11y::name(&edit, &tr_args("Item {}", &[&row]));
                 let mut button = |action: &str, symbol: &str, label: &str, enabled: bool| {
                     let b = ui.add_enabled(enabled, egui::Button::new(symbol)).on_hover_text(tr(label));
+                    // The glyph stays first (WCAG 2.5.3); the row says which item the action is for.
+                    crate::a11y::button(&b, &tr_args("{} {}, item {}", &[&symbol, &tr(label), &row]), enabled);
                     regs.push((format!("{prefix}.{action}.{i}"), b.rect, label.into()));
                     b.clicked()
                 };

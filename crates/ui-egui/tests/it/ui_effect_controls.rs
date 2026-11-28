@@ -9,7 +9,7 @@ use effectcraft_ui_egui::EffectcraftApp;
 use effectcraft_ui_egui::dock::PanelKind;
 use effectcraft_ui_egui::state::FxPick;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::json;
 
 struct Ids {
@@ -607,6 +607,33 @@ fn dropdown_text_undo_follows_the_item_and_starts_fresh_on_reopen() {
     click_id(&mut h, &edit);
     undo_in(&mut h, 1);
     assert_eq!(label(&h, 1), "Saved", "the reopened editor starts with the committed label");
+}
+
+#[test]
+fn dropdown_editor_row_actions_name_their_row() {
+    let mut session = Session::default();
+    session.execute("comp.new", json!({"width": 160, "height": 90})).unwrap();
+    session.execute("layer.newSolid", json!({})).unwrap();
+    let effect = session.execute("effect.apply", json!({"effect": "Dropdown Menu Control"})).unwrap()["effects"][0].as_u64().unwrap();
+    let mut app = EffectcraftApp::new(session);
+    app.show_panel(PanelKind::EffectControls);
+    app.toggle_maximize(PanelKind::EffectControls);
+    let mut h = Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(|_| app);
+    h.run_steps(4);
+    click_id(&mut h, &format!("effectControls.effect.{effect}.edit"));
+    // The default list has three items; keep two so the first and last rows are both edges.
+    click_id(&mut h, "form.field.items.remove.2");
+
+    let button = |h: &Harness<'_, EffectcraftApp>, name: &str| h.get_by_role_and_label(egui::accesskit::Role::Button, name).accesskit_node().is_disabled();
+    assert!(button(&h, "↑ Move Up, item 1"), "the first row cannot move up");
+    assert!(!button(&h, "↑ Move Up, item 2"));
+    assert!(!button(&h, "↓ Move Down, item 1"));
+    assert!(button(&h, "↓ Move Down, item 2"), "the last row cannot move down");
+    assert!(!button(&h, "− Remove, item 1"));
+    assert!(!button(&h, "− Remove, item 2"));
+    for row in ["Item 1", "Item 2"] {
+        h.get_by_role_and_label(egui::accesskit::Role::MultilineTextInput, row);
+    }
 }
 
 #[test]
