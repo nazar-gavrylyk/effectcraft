@@ -35,6 +35,7 @@
 
 mod encode;
 pub mod exr_out;
+mod hardware;
 mod hevc_av1;
 mod out;
 mod pipeline;
@@ -53,6 +54,7 @@ use effectcraft_render::{ExprHost, FootageSource};
 
 pub use effectcraft_project::render_queue;
 pub use effectcraft_project::render_queue::StorageQuota;
+pub use hardware::{HardwareJob, HardwareOffer, HardwarePacket, HardwareRequest, HardwareVideo};
 pub use out::Sink;
 pub(crate) use pipeline::Cx;
 pub use pipeline::{CACHE_BUDGET, GPU_INFLIGHT_MAX, RENDERER_ENV, auto_gpu_frames, pick_renderer};
@@ -150,6 +152,11 @@ pub struct JobOptions<'a> {
     /// in the memory accountant's common budget, so together with the other caches they stay
     /// within it. `None`: [`CACHE_BUDGET`].
     pub cache_budget: Option<usize>,
+    /// Settings ▸ Hardware Encoding: a hook that can encode H.264 on the machine's video
+    /// hardware. `None` (Off, and the web): the built-in software encoder, as before. With a
+    /// hook, an H.264 export that it cannot take (no device, a size it cannot do) falls back
+    /// to software and the render log says why; a hook's job that fails fails the export.
+    pub hardware: Option<&'a dyn HardwareVideo>,
 }
 
 /// The layer caches of a Render Queue run (see [`JobOptions::caches`]): one per compositor,
@@ -314,6 +321,7 @@ async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t
     let mut st = State { t0, total, done: 0, progress };
     st.advance(0)?;
     let (w, h) = output_size(comp, cx.settings, cx.output);
+    hardware::note_format(cx);
     let mut report = match cx.output.format {
         OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes | OutputFormat::Uncompressed => {
             encode::movie(cx, comp, w, h, &mut st).await?

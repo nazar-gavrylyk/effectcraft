@@ -86,7 +86,7 @@ impl Yuv420 {
         rgba_to_yuv420(rgba, w, h, &mut y, &mut u, &mut v);
         Yuv420::Planes { y, u, v }
     }
-    fn slices(&self, w: usize, h: usize) -> (&[u8], &[u8], &[u8]) {
+    pub(crate) fn slices(&self, w: usize, h: usize) -> (&[u8], &[u8], &[u8]) {
         match self {
             Yuv420::Planes { y, u, v } => (y, u, v),
             Yuv420::Packed(p) => {
@@ -118,6 +118,11 @@ pub(crate) trait VideoEncoder: Send {
 
 // ---------------------------------------------------------------- H.264
 
+/// A key frame every two seconds.
+pub(crate) fn keyint(rate: FrameRate) -> u32 {
+    (rate.as_f64() * 2.0).round().max(1.0) as u32
+}
+
 struct H264 {
     enc: craft_video::h264::Encoder,
     w: u32,
@@ -134,7 +139,7 @@ impl H264 {
         let mut cfg = craft_video::h264::EncoderConfig::new(w, h, rate.num as u32, rate.den as u32);
         cfg.format = craft_video::h264::PacketFormat::LengthPrefixed;
         cfg.aud = false;
-        cfg.keyint = (rate.as_f64() * 2.0).round().max(1.0) as u32;
+        cfg.keyint = keyint(rate);
         let kbps = kbps.max(100);
         cfg.rate = craft_video::h264::RateControl::Vbr { target_kbps: kbps, max_kbps: kbps * 3 / 2 };
         cfg.color = craft_video::h264::ColorConfig { primaries: codes.primaries, transfer: codes.transfer, matrix: codes.matrix, full_range: false };
@@ -361,7 +366,10 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     };
     let codes = output_codes(&job.project.settings, channels);
     let mut venc: Box<dyn VideoEncoder> = match fmt {
-        OutputFormat::H264 => Box::new(H264::new(w, h, rate, job.output.bitrate_kbps, codes)?),
+        OutputFormat::H264 => match crate::hardware::open(job, w, h, rate, codes)? {
+            Some(hardware) => Box::new(hardware),
+            None => Box::new(H264::new(w, h, rate, job.output.bitrate_kbps, codes)?),
+        },
         OutputFormat::Hevc => Box::new(crate::hevc_av1::Hevc::new(w, h, rate, job.output, codes)?),
         OutputFormat::Av1 => Box::new(crate::hevc_av1::Av1::new(w, h, rate, job.output, codes)?),
         OutputFormat::Uncompressed => Box::new(crate::uncompressed::Raw::new(w, h, channels == Channels::Rgba)?),
@@ -408,7 +416,10 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     st.advance(first_end)?;
 
     let path = job.place(job.path, 1);
-    let mut file = job.timed(Stage::Write, || job.create(&path))?;
+    // A hardware job writes beside the target and renames when it is whole, so a failed one never
+    // leaves a movie at the output path.
+    let part = (job.uses_hardware() && job.sink.is_none()).then(|| format!("{path}.part"));
+    let mut file = job.timed(Stage::Write, || job.create(part.as_deref().unwrap_or(&path)))?;
     let opts = WriterOptions::new(brand);
     let movie_ts = opts.movie_timescale.max(1) as i128;
     let t = Instant::now();
@@ -514,6 +525,9 @@ pub(crate) async fn movie(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut St
     job.add_time(Stage::Write, t);
     finished?;
     let bytes = job.timed(Stage::Write, || file.finish())?;
+    if let Some(part) = &part {
+        job.timed(Stage::Write, || std::fs::rename(part, &path).map_err(mux_err))?;
+    }
     Ok(Report { path, frames: 0, width: w, height: h, seconds: 0.0, bytes, audio: with_audio, log: None, overflow: vec![], timing: Default::default() })
 }
 

@@ -70,6 +70,7 @@ impl Exporter for FileExporter {
                     gpu_frames: job.gpu_frames,
                     free_memory: Some(&free_memory),
                     cache_budget: job.cache_budget,
+                    hardware: None,
                 },
                 nested_switches: job.nested_switches,
             };

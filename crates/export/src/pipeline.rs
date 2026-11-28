@@ -275,6 +275,9 @@ pub(crate) struct Cx<'a> {
     /// Files written to an overflow folder.
     pub overflowed: Mutex<Vec<String>>,
     written: Mutex<Vec<String>>,
+    /// What encodes the video when hardware encoding was on: `Ok` the hardware encoder's
+    /// description, `Err` why software did.
+    hardware: Mutex<Option<std::result::Result<String, String>>>,
     /// Busy time per stage, for the log's timing line (#3713).
     phases: Phases,
 }
@@ -408,6 +411,7 @@ impl<'a> Cx<'a> {
             frame_times,
             overflowed: Mutex::new(vec![]),
             written: Mutex::new(vec![]),
+            hardware: Mutex::new(None),
             phases: Phases::default(),
         };
         if let Some(c) = cx.fixed_choice(std::env::var(RENDERER_ENV).ok().as_deref()) {
@@ -448,7 +452,7 @@ impl<'a> Cx<'a> {
             frames,
             frames_per_second: if wall > 0.0 { frames as f64 / wall } else { 0.0 },
             renderer: self.choice().map_or_else(|| "none was needed".to_string(), |c| describe_choice(&c)),
-            encoder: describe_encoder(self.job.output),
+            encoder: describe_encoder(self.job.output, self.hardware.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()),
         }
     }
 
@@ -977,6 +981,20 @@ impl<'a> Cx<'a> {
         Ok(file)
     }
 
+    /// Record what encodes the video (see [`Cx::hardware`]) and say so in the log.
+    pub(crate) fn note_hardware(&self, what: std::result::Result<String, String>) {
+        match &what {
+            Ok(d) => log::info!(target: "effectcraft_export", "{}: hardware encoder: {d}", self.job.options.label),
+            Err(why) => log::info!(target: "effectcraft_export", "{}: software encoder: {why}", self.job.options.label),
+        }
+        *self.hardware.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(what);
+    }
+
+    /// Whether a hardware encoder encodes the video.
+    pub(crate) fn uses_hardware(&self) -> bool {
+        matches!(*self.hardware.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(Ok(_)))
+    }
+
     /// Remove every file [`Cx::create`] opened: an export that did not finish leaves none of
     /// them behind (a file already gone is fine). Returns the first file that could not be
     /// removed, with why (`"<path>: <error>"`).
@@ -1088,9 +1106,10 @@ impl<'a> Cx<'a> {
     }
 }
 
-/// The render log's account of the encoder: every encoder here is built in and runs on the
-/// CPU (no hardware encoder is used), with the codec settings of the Output Module.
-pub(crate) fn describe_encoder(om: &OutputModule) -> String {
+/// The render log's account of the encoder, with the codec settings of the Output Module: a
+/// built-in software encoder, or (`hardware`, see [`Cx::note_hardware`]) the hardware encoder
+/// that ran or why software did.
+pub(crate) fn describe_encoder(om: &OutputModule, hardware: Option<&std::result::Result<String, String>>) -> String {
     use effectcraft_project::render_queue::{ProResProfile, WebmVideoCodec};
     let rate = |om: &OutputModule| match om.codec.rate_control {
         effectcraft_project::render_queue::RateControlMode::Bitrate => format!("{} kbps", om.bitrate_kbps),
@@ -1113,7 +1132,11 @@ pub(crate) fn describe_encoder(om: &OutputModule) -> String {
         OutputFormat::WebM => format!(", {:?}{}", om.webm_codec, if om.webm_bitrate { format!(", {} kbps", om.bitrate_kbps) } else { String::new() }),
         _ => String::new(),
     };
-    format!("{label}{settings}, built-in software encoder (not a hardware encoder)")
+    match hardware {
+        Some(Ok(encoder)) => format!("{label}{settings}, hardware encoder {encoder}"),
+        Some(Err(why)) => format!("{label}{settings}, built-in software encoder (not a hardware encoder; hardware encoding was not used: {why})"),
+        None => format!("{label}{settings}, built-in software encoder (not a hardware encoder)"),
+    }
 }
 
 /// The render log's account of a job's compositor: which, why, and what was measured.
@@ -1217,16 +1240,16 @@ mod tests {
     fn the_encoder_description_names_what_is_written() {
         use effectcraft_project::render_queue::{Channels, ProResProfile, WebmVideoCodec};
         let mut om = OutputModule { format: OutputFormat::ProRes, prores_profile: ProResProfile::Hq, channels: Channels::Rgb, ..OutputModule::default() };
-        let hq = describe_encoder(&om);
+        let hq = describe_encoder(&om, None);
         assert!(hq.contains(ProResProfile::Hq.label()) && !hq.contains("4444"), "{hq}");
         om.channels = Channels::Rgba;
-        let alpha = describe_encoder(&om);
+        let alpha = describe_encoder(&om, None);
         assert!(alpha.contains(ProResProfile::P4444.label()) && !alpha.contains(ProResProfile::Hq.label()), "{alpha}");
         let mut web = OutputModule { format: OutputFormat::WebM, webm_codec: WebmVideoCodec::Av1, ..OutputModule::default() };
-        let av1 = describe_encoder(&web);
+        let av1 = describe_encoder(&web, None);
         assert!(av1.starts_with("WebM (AV1 + Opus)") && !av1.contains("VP9") && av1.contains("profile"), "{av1}");
         web.webm_codec = WebmVideoCodec::Vp9;
-        let vp9 = describe_encoder(&web);
+        let vp9 = describe_encoder(&web, None);
         assert!(vp9.starts_with("WebM (VP9 + Opus)") && !vp9.contains("AV1"), "{vp9}");
     }
 

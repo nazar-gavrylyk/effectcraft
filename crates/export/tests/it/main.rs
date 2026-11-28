@@ -6,6 +6,7 @@ mod banding;
 mod export_timing;
 mod exr_scene_linear;
 mod h264_gpu_yuv;
+mod hardware_h264;
 mod hevc_av1_roundtrip;
 mod hevc_encoder;
 #[cfg(not(target_arch = "wasm32"))]
