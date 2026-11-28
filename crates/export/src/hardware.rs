@@ -5,7 +5,7 @@ use craft_media::isobmff::{AvcConfig, SampleEntry};
 use effectcraft_project::render_queue::OutputFormat;
 use effectcraft_time::FrameRate;
 
-use crate::encode::{Codes, Packet, VideoEncoder, Yuv420, keyint, rgba_to_yuv420, tag_nclx_limited};
+use crate::encode::{Codes, Packet, VideoEncoder, Yuv420, keyint, tag_nclx_limited};
 use crate::{Cx, ExportError, Result};
 
 /// What the hardware encoder is asked for: 8-bit 4:2:0 H.264 High, limited range, with the
@@ -50,7 +50,7 @@ pub trait HardwareVideo: Send + Sync {
     fn open(&self, request: &HardwareRequest) -> Result<HardwareOffer>;
 }
 
-/// One open hardware encode. Dropping it without [`HardwareJob::finish`] cancels it.
+/// One open hardware encode. The export calls [`HardwareJob::cancel`] on a job it abandons.
 pub trait HardwareJob: Send {
     /// What encodes, for the render log ("VA-API (Intel Iris Xe Graphics), helper 0.1.0").
     fn description(&self) -> String;
@@ -65,6 +65,8 @@ pub trait HardwareJob: Send {
     fn take_packets(&mut self) -> Result<Vec<HardwarePacket>>;
     /// End the stream and return the remaining packets.
     fn finish(&mut self) -> Result<Vec<HardwarePacket>>;
+    /// Stop the job and free the device. Also called after a failed `finish`, so it must be
+    /// harmless when the job has already ended or failed, and when called twice.
     fn cancel(&mut self);
 }
 
@@ -80,8 +82,9 @@ pub(crate) fn note_format(cx: &Cx) {
 /// noted in the log).
 pub(crate) fn open(cx: &Cx, w: u32, h: u32, rate: FrameRate, codes: Codes) -> Result<Option<HardwareH264>> {
     let Some(hook) = cx.options.hardware else { return Ok(None) };
-    let num = u32::try_from(rate.num).map_err(|_| ExportError::Unsupported("the frame rate is too large for hardware encoding".into()))?;
-    let den = u32::try_from(rate.den).map_err(|_| ExportError::Unsupported("the frame rate is too large for hardware encoding".into()))?;
+    let (Ok(num), Ok(den)) = (u32::try_from(rate.num), u32::try_from(rate.den)) else {
+        return Err(ExportError::Unsupported("the frame rate is too large for hardware encoding".into()));
+    };
     let request = HardwareRequest {
         width: w,
         height: h,
@@ -117,9 +120,14 @@ pub(crate) struct HardwareH264 {
 }
 
 impl HardwareH264 {
-    fn new(job: Box<dyn HardwareJob>, w: u32, h: u32, rate: FrameRate, codes: Codes) -> Result<HardwareH264> {
-        let config =
-            AvcConfig::parse(&job.codec_config()).map_err(|e| ExportError::Encode(format!("the hardware encoder's codec configuration is invalid: {e}")))?;
+    fn new(mut job: Box<dyn HardwareJob>, w: u32, h: u32, rate: FrameRate, codes: Codes) -> Result<HardwareH264> {
+        let config = match AvcConfig::parse(&job.codec_config()) {
+            Ok(config) => config,
+            Err(e) => {
+                job.cancel();
+                return Err(ExportError::Encode(format!("the hardware encoder's codec configuration is invalid: {e}")));
+            }
+        };
         Ok(HardwareH264 { job, config, w, h, rate, codes, finished: false, checked: false })
     }
 
@@ -127,8 +135,7 @@ impl HardwareH264 {
         let expected = i64::from(self.job.delay()) * self.rate.den;
         let mut out = Vec::with_capacity(ps.len());
         for p in ps {
-            let offset = p.pts.checked_sub(p.dts);
-            let cto = offset.and_then(|d| i32::try_from(d).ok());
+            let cto = p.pts.checked_sub(p.dts).and_then(|d| i32::try_from(d).ok());
             let cto = cto.ok_or_else(|| ExportError::Encode(format!("the hardware encoder gave a frame time out of range (pts {}, dts {})", p.pts, p.dts)))?;
             if !self.checked && i64::from(cto) != expected {
                 return Err(ExportError::Encode(format!(
@@ -151,10 +158,8 @@ impl VideoEncoder for HardwareH264 {
         tag_nclx_limited(&mut entry, self.codes);
         entry
     }
-    fn encode(&mut self, rgba: &[u8], index: u64) -> Result<Vec<Packet>> {
-        let (mut y, mut u, mut v) = (vec![], vec![], vec![]);
-        rgba_to_yuv420(rgba, self.w as usize, self.h as usize, &mut y, &mut u, &mut v);
-        self.encode_yuv420(&Yuv420::Planes { y, u, v }, index)
+    fn encode(&mut self, _rgba: &[u8], _index: u64) -> Result<Vec<Packet>> {
+        Err(ExportError::Unsupported("the hardware encoder takes 4:2:0 frames".into()))
     }
     fn takes_yuv420(&self) -> bool {
         true

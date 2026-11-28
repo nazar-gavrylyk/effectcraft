@@ -32,13 +32,6 @@ fn project(frames: u64) -> (Project, ItemId) {
     (p, cid)
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Fail {
-    Never,
-    /// `submit` of this frame.
-    Submit(u64),
-}
-
 #[derive(Default)]
 struct Calls {
     opened: AtomicUsize,
@@ -51,7 +44,10 @@ struct Calls {
 struct Stand {
     /// Frames `dts` runs behind `pts` at the start, which is what the job reports as its delay.
     lead: u32,
-    fail: Fail,
+    /// `submit` of this frame fails.
+    fail_at: Option<u64>,
+    /// The job's `avcC` record is not one.
+    bad_config: bool,
     declines: Option<String>,
     /// Added to the delay the job reports, so it differs from the `dts` lead it produces.
     delay_error: u32,
@@ -61,7 +57,7 @@ struct Stand {
 
 impl Stand {
     fn new(target: &Path) -> Stand {
-        Stand { lead: 0, fail: Fail::Never, declines: None, delay_error: 0, target: target.to_owned(), calls: Arc::default() }
+        Stand { lead: 0, fail_at: None, bad_config: false, declines: None, delay_error: 0, target: target.to_owned(), calls: Arc::default() }
     }
 }
 
@@ -72,7 +68,8 @@ struct StandJob {
     delay_error: u32,
     frame: u64,
     ready: Vec<HardwarePacket>,
-    fail: Fail,
+    fail_at: Option<u64>,
+    bad_config: bool,
     target: PathBuf,
     calls: Arc<Calls>,
 }
@@ -97,7 +94,8 @@ impl HardwareVideo for Stand {
             delay_error: self.delay_error,
             frame: 0,
             ready: vec![],
-            fail: self.fail,
+            fail_at: self.fail_at,
+            bad_config: self.bad_config,
             target: self.target.clone(),
             calls: self.calls.clone(),
         };
@@ -119,13 +117,13 @@ impl HardwareJob for StandJob {
         "Stand-in API (Stand-in GPU), helper 9.9".into()
     }
     fn codec_config(&self) -> Vec<u8> {
-        self.enc.avcc()
+        if self.bad_config { vec![1, 2, 3] } else { self.enc.avcc() }
     }
     fn delay(&self) -> u32 {
         self.lead + self.delay_error
     }
     fn submit(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Result<(), ExportError> {
-        if self.fail == Fail::Submit(self.frame) {
+        if self.fail_at == Some(self.frame) {
             return Err(ExportError::Encode("the video helper stopped".into()));
         }
         let frame = craft_video::h264::YuvFrame { y, u, v, y_stride: W as usize, uv_stride: W as usize / 2 };
@@ -216,7 +214,7 @@ fn a_hardware_job_that_fails_midway_leaves_no_movie_and_no_part_file() {
     let path = dir.path().join("hw.mp4");
     std::fs::write(&path, b"an earlier render").expect("earlier render");
     let mut stand = Stand::new(&path);
-    stand.fail = Fail::Submit(60);
+    stand.fail_at = Some(60);
     let r = run(80, &h264(), Some(&stand), &path, |_| true);
 
     match r {
@@ -291,4 +289,20 @@ fn a_first_packet_offset_that_differs_from_the_reported_delay_fails_the_export()
         }
         assert!(!path.exists() && !part(&path).exists());
     }
+}
+
+#[test]
+fn a_job_with_an_invalid_codec_config_is_cancelled_and_fails_the_export() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("hw.mp4");
+    let mut stand = Stand::new(&path);
+    stand.bad_config = true;
+    let r = run(12, &h264(), Some(&stand), &path, |_| true);
+
+    match r {
+        Err(ExportError::Encode(why)) => assert!(why.contains("codec configuration"), "{why}"),
+        other => panic!("expected the configuration error, got {other:?}"),
+    }
+    assert_eq!(stand.calls.cancelled.load(Ordering::SeqCst), 1, "the helper job is not left open");
+    assert!(!path.exists() && !part(&path).exists());
 }
